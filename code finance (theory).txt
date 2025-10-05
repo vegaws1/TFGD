@@ -1,0 +1,719 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.special import gamma
+import os
+from typing import Tuple, Dict, List
+import warnings
+from scipy.stats import norm
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+
+# Set seeds for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+
+def ensure_dir():
+    """Ensure figures directory exists"""
+    if not os.path.exists('figs'):
+        os.makedirs('figs')
+
+# =============================================================
+# Enhanced Theoretical Validator
+# =============================================================
+class TheoreticalValidator:
+    def fractional_weights(self, alpha: float, n: int) -> np.ndarray:
+        if n <= 0:
+            return np.array([], dtype=float)
+        if n == 1:
+            return np.ones(1, dtype=float)
+        k = np.arange(1, n, dtype=float)
+        factors = 1.0 - (1.0 + alpha) / k
+        w_tail = np.cumprod(factors)
+        return np.concatenate([np.ones(1, dtype=float), w_tail])
+
+    def tempered_weights(self, alpha: float, lam: float, n: int) -> np.ndarray:
+        w = self.fractional_weights(alpha, n)
+        k = np.arange(n, dtype=float)
+        return w * np.exp(-lam * k)
+
+    def asymptotic(self, alpha: float, k: np.ndarray) -> np.ndarray:
+        return (k ** (alpha - 1.0)) / gamma(alpha)
+
+    def alignment_theory(self, alpha: float, lam: float) -> float:
+        return (1.0 - np.exp(-lam)) ** (alpha)
+    
+    def memory_horizon(self, lam: float, eps: float = 1e-3) -> float:
+        return -np.log(eps) / lam
+
+# =============================================================
+# Enhanced TF-AMAR Model
+# =============================================================
+class EnhancedTFAMAR(nn.Module):
+    def __init__(self, p=5, q=3, mu_bounds=(0.05,0.95), nu_bounds=(0.05,0.95),
+                 mu0=0.5, nu0=0.3, lam0=0.5, lame0=0.5, lamY0=0.5):
+        super().__init__()
+        self.p, self.q = int(p), int(q)
+        self.mu_lb, self.mu_ub = mu_bounds
+        self.nu_lb, self.nu_ub = nu_bounds
+        
+        def inv_sigmoid(x):
+            x = np.clip(x,1e-6,1-1e-6); 
+            return float(np.log(x/(1-x)))
+        
+        mu_c = (mu0 - self.mu_lb) / (self.mu_ub - self.mu_lb)
+        nu_c = (nu0 - self.nu_lb) / (self.nu_ub - self.nu_lb)
+        
+        self.mu_raw = nn.Parameter(torch.tensor(inv_sigmoid(mu_c), dtype=torch.float32))
+        self.nu_raw = nn.Parameter(torch.tensor(inv_sigmoid(nu_c), dtype=torch.float32))
+        self.lam_raw = nn.Parameter(torch.tensor(np.log(max(lam0,1e-6)), dtype=torch.float32))
+        self.lame_raw = nn.Parameter(torch.tensor(np.log(max(lame0,1e-6)), dtype=torch.float32))
+        self.lamY_raw = nn.Parameter(torch.tensor(np.log(max(lamY0,1e-6)), dtype=torch.float32))
+
+    def mu_eff(self):
+        s = torch.sigmoid(self.mu_raw); 
+        return self.mu_lb + (self.mu_ub-self.mu_lb)*s
+    
+    def nu_eff(self):
+        s = torch.sigmoid(self.nu_raw); 
+        return self.nu_lb + (self.nu_ub-self.nu_lb)*s
+    
+    def lam_eff(self):  return torch.exp(self.lam_raw)
+    def lame_eff(self): return torch.exp(self.lame_raw)
+    def lamY_eff(self): return torch.exp(self.lamY_raw)
+
+    @staticmethod
+    def frac_w(alpha: torch.Tensor, n: int) -> torch.Tensor:
+        device, dtype = alpha.device, alpha.dtype
+        if n<=0: return torch.empty(0, device=device, dtype=dtype)
+        if n==1: return torch.ones(1, device=device, dtype=dtype)
+        k = torch.arange(1,n, device=device, dtype=dtype)
+        factors = 1.0 - (1.0 + alpha) / k
+        tail = torch.cumprod(factors, dim=0)
+        return torch.cat([torch.ones(1, device=device, dtype=dtype), tail], dim=0)
+
+    def temp_recency(self, alpha: torch.Tensor, L: int, lam: torch.Tensor) -> torch.Tensor:
+        w = self.frac_w(alpha, L)
+        k = torch.arange(L, device=w.device, dtype=w.dtype)
+        return w * torch.exp(-lam * k)
+
+    def batch_predict(self, Y: torch.Tensor, E: torch.Tensor, start: int) -> torch.Tensor:
+        device = Y.device; dtype = Y.dtype
+        T = Y.shape[0]; p=self.p; q=self.q
+        B = T - start
+        
+        Yw = torch.stack([Y[t-p:t] for t in range(start, T)], dim=0).to(device)
+        Ew = torch.stack([E[t-q:t] for t in range(start, T)], dim=0).to(device)
+        
+        mu = self.mu_eff().to(dtype); nu = self.nu_eff().to(dtype)
+        lam = self.lam_eff().to(dtype); lame = self.lame_eff().to(dtype); lamY = self.lamY_eff().to(dtype)
+        
+        w_ar = self.temp_recency(-nu, p, lamY)
+        w_ma_full = self.temp_recency(-mu, q+1, lame)
+        w_ma = w_ma_full[1:]
+        
+        ar = (w_ar.flip(0).unsqueeze(0) * Yw).sum(dim=1)
+        ma = lam * (w_ma.flip(0).unsqueeze(0) * Ew).sum(dim=1)
+        
+        return ma - ar
+
+    def memory_coeffs(self):
+        with torch.no_grad():
+            mu = self.mu_eff().float(); nu = self.nu_eff().float()
+            lam = self.lam_eff().float(); lame = self.lame_eff().float(); lamY = self.lamY_eff().float()
+            ma_w = self.frac_w(-mu, self.q+1).cpu().numpy()
+            ar_w = self.frac_w(-nu, self.p).cpu().numpy()
+            k_ma = np.arange(self.q+1); k_ar = np.arange(self.p)
+            ma = float(lam.item())*ma_w*np.exp(-float(lame.item())*k_ma)
+            ar = -ar_w*np.exp(-float(lamY.item())*k_ar)
+            return ma, ar
+
+# =============================================================
+# Synthetic Data Generation
+# =============================================================
+def generate_synthetic_data(n=1000, seed=42):
+    rng = np.random.default_rng(seed)
+    e = rng.normal(0, 0.01, n).astype(np.float32)
+    Y = np.zeros(n, dtype=np.float32)
+    phi, theta, a = 0.1, 0.2, 0.3
+    for t in range(2,n):
+        mem = 0.0
+        for j in range(1, min(t, 50)):
+            mem += j**(-a-1)*Y[t-j]
+        Y[t] = phi*Y[t-1] + theta*e[t-1] + 0.1*mem + e[t]
+    return torch.from_numpy(Y), torch.from_numpy(e)
+
+# =============================================================
+# Figure Generation Functions
+# =============================================================
+def plot_theoretical_properties():
+    """Generate all theoretical property figures"""
+    ensure_dir()
+    V = TheoreticalValidator()
+    
+    # Figure 1: Weight asymptotics
+    plt.figure(figsize=(10, 6))
+    alphas = [0.1, 0.3, 0.5, 0.7, 0.9]
+    k = np.arange(5, 1000)
+    
+    for a in alphas:
+        actual = np.array([V.fractional_weights(a, m)[-1] for m in k+1])
+        theory = V.asymptotic(a, k)
+        ratio = np.abs(actual)/(np.abs(theory)+1e-12)
+        plt.semilogx(k, ratio, label=f"α={a}", linewidth=2)
+    
+    plt.axhline(1.0, color='k', ls='--', lw=1, alpha=0.7)
+    plt.xlabel('Lag k (log scale)')
+    plt.ylabel('|ω_k| / |k^{α-1}/Γ(α)|')
+    plt.title('Asymptotic Convergence of Fractional Weights')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('figs/fig1_weight_asymptotics.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Figure 2: Tempered decay
+    plt.figure(figsize=(12, 5))
+    alpha = 0.5
+    k = np.arange(50)
+    lams = [0.1, 0.3, 0.5, 1.0]
+    
+    plt.subplot(1, 2, 1)
+    untempered = V.fractional_weights(alpha, len(k))
+    plt.semilogy(k, np.abs(untempered), 'k--', label='Untempered', linewidth=2)
+    for lam in lams:
+        tempered = V.tempered_weights(alpha, lam, len(k))
+        plt.semilogy(k, np.abs(tempered), label=f'λ={lam}', linewidth=2)
+    plt.xlabel('Lag k')
+    plt.ylabel('|Weight| (log scale)')
+    plt.title('Tempered vs Untempered Weights')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    lam_range = np.linspace(0.1, 2.0, 100)
+    horizons = [V.memory_horizon(lam) for lam in lam_range]
+    plt.plot(lam_range, horizons, 'r-', linewidth=2)
+    plt.xlabel('Tempering Parameter λ')
+    plt.ylabel('Effective Memory Horizon')
+    plt.title('Memory-Length Trade-off')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('figs/fig2_tempered_decay.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Figure 3: Alignment coefficient
+    plt.figure(figsize=(8, 6))
+    alpha = 0.5
+    lam_range = np.linspace(0.1, 2.0, 50)
+    theoretical = [V.alignment_theory(alpha, lam) for lam in lam_range]
+    
+    # Empirical calculation
+    n_terms = 10000
+    k_vals = np.arange(n_terms)
+    weights = V.fractional_weights(alpha, n_terms)
+    empirical = []
+    for lam in lam_range:
+        tempered = weights * np.exp(-lam * k_vals)
+        empirical.append(np.sum(tempered))
+    
+    plt.plot(lam_range, theoretical, 'k-', label='Theoretical', linewidth=3)
+    plt.plot(lam_range, empirical, 'r--', label='Empirical', linewidth=2)
+    plt.xlabel('Tempering Parameter λ')
+    plt.ylabel('Alignment Coefficient')
+    plt.title(f'Alignment Coefficient (α={alpha})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('figs/fig3_alignment_coefficient.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_training_results(model, losses, param_history, val_predictions=None):
+    """Generate training and model analysis figures"""
+    ensure_dir()
+    
+    # Figure 4: Training loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(losses, 'b-', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE Loss')
+    plt.title('TF-AMAR Training Loss')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('figs/fig4_training_loss.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Figure 5: Parameter trajectories
+    plt.figure(figsize=(12, 8))
+    epochs = range(len(losses))
+    
+    plt.subplot(2, 3, 1)
+    plt.plot(epochs, param_history['mu'], 'b-', linewidth=2)
+    plt.title('μ (MA Fractional Order)')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 2)
+    plt.plot(epochs, param_history['nu'], 'g-', linewidth=2)
+    plt.title('ν (AR Fractional Order)')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 3)
+    plt.plot(epochs, param_history['lambda_param'], 'r-', linewidth=2)
+    plt.title('λ (Scaling Parameter)')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 4)
+    plt.plot(epochs, param_history['lambda_eps'], 'c-', linewidth=2)
+    plt.title('λ_ε (MA Tempering)')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 5)
+    plt.plot(epochs, param_history['lambda_Y'], 'm-', linewidth=2)
+    plt.title('λ_Y (AR Tempering)')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 6)
+    plt.plot(epochs, losses, 'k-', linewidth=2)
+    plt.title('Training Loss')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figs/fig5_parameter_trajectories.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Figure 6: Memory coefficients
+    ma_coeffs, ar_coeffs = model.memory_coeffs()
+    plt.figure(figsize=(10, 6))
+    
+    plt.subplot(1, 2, 1)
+    plt.stem(range(len(ma_coeffs)), ma_coeffs, linefmt='C0-', markerfmt='C0o', basefmt='k-')
+    plt.xlabel('Lag')
+    plt.ylabel('Coefficient Value')
+    plt.title('MA Memory Coefficients')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    plt.stem(range(len(ar_coeffs)), ar_coeffs, linefmt='C1-', markerfmt='C1s', basefmt='k-')
+    plt.xlabel('Lag')
+    plt.ylabel('Coefficient Value')
+    plt.title('AR Memory Coefficients')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figs/fig6_memory_coefficients.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Figure 7: Prediction vs Actual (if validation data provided)
+    if val_predictions is not None:
+        y_true, y_pred = val_predictions
+        plt.figure(figsize=(12, 8))
+        
+        plt.subplot(2, 2, 1)
+        plt.plot(y_true[:200], 'b-', label='True', alpha=0.7)
+        plt.plot(y_pred[:200], 'r--', label='Predicted', alpha=0.7)
+        plt.xlabel('Time Step')
+        plt.ylabel('Value')
+        plt.title('Predictions vs Actual (First 200 steps)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 2, 2)
+        plt.scatter(y_true, y_pred, alpha=0.5, s=10)
+        min_val = min(y_true.min(), y_pred.min())
+        max_val = max(y_true.max(), y_pred.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7)
+        plt.xlabel('True Values')
+        plt.ylabel('Predicted Values')
+        plt.title('Prediction Scatter Plot')
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 2, 3)
+        errors = y_pred - y_true
+        plt.hist(errors, bins=50, alpha=0.7, edgecolor='black')
+        plt.xlabel('Prediction Error')
+        plt.ylabel('Frequency')
+        plt.title('Prediction Error Distribution')
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 2, 4)
+        from scipy import stats
+        stats.probplot(errors, dist="norm", plot=plt)
+        plt.title('Q-Q Plot of Prediction Errors')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('figs/fig7_prediction_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+def create_enhanced_figures(model, metrics, param_history, val_predictions):
+    """Create additional enhanced analysis figures"""
+    ensure_dir()
+    y_true, y_pred = val_predictions
+    errors = y_pred - y_true
+    ma_coeffs, ar_coeffs = model.memory_coeffs()
+    
+    # Figure 8: Enhanced error analysis
+    plt.figure(figsize=(15, 10))
+    
+    # Subplot 1: Error distribution with normal fit
+    plt.subplot(2, 3, 1)
+    plt.hist(errors, bins=50, density=True, alpha=0.7, color='skyblue', edgecolor='black')
+    xmin, xmax = plt.xlim()
+    x = np.linspace(xmin, xmax, 100)
+    p = norm.pdf(x, np.mean(errors), np.std(errors))
+    plt.plot(x, p, 'r-', linewidth=2, label='Normal fit')
+    plt.xlabel('Prediction Error')
+    plt.ylabel('Density')
+    plt.title('Error Distribution with Normal Fit')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 2: Cumulative returns comparison
+    plt.subplot(2, 3, 2)
+    signals = np.sign(y_pred)
+    strategy_returns = y_true * signals
+    cumulative_bh = np.cumsum(y_true)
+    cumulative_strategy = np.cumsum(strategy_returns)
+    
+    plt.plot(cumulative_bh, 'b-', label='Buy & Hold', linewidth=2)
+    plt.plot(cumulative_strategy, 'r-', label='TF-AMAR Strategy', linewidth=2)
+    plt.xlabel('Time Step')
+    plt.ylabel('Cumulative Return')
+    plt.title('Trading Strategy vs Buy & Hold')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 3: Rolling directional accuracy
+    plt.subplot(2, 3, 3)
+    window = 50
+    rolling_da = [np.mean(np.sign(y_pred[i:i+window]) == np.sign(y_true[i:i+window])) * 100 
+                  for i in range(len(y_pred)-window)]
+    plt.plot(rolling_da, 'g-', linewidth=2)
+    plt.axhline(50, color='r', linestyle='--', alpha=0.7, label='Random (50%)')
+    plt.xlabel('Time Step')
+    plt.ylabel('Rolling Directional Accuracy (%)')
+    plt.title(f'Rolling Directional Accuracy (Window={window})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 4: Parameter convergence zoom
+    plt.subplot(2, 3, 4)
+    epochs = range(len(param_history['mu']))
+    plt.plot(epochs, param_history['mu'], 'b-', label='μ', linewidth=2)
+    plt.plot(epochs, param_history['nu'], 'r-', label='ν', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Parameter Value')
+    plt.title('Fractional Order Convergence')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 5: Tempering parameter evolution
+    plt.subplot(2, 3, 5)
+    plt.plot(epochs, param_history['lambda_eps'], 'c-', label='λ_ε', linewidth=2)
+    plt.plot(epochs, param_history['lambda_Y'], 'm-', label='λ_Y', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Tempering Parameter')
+    plt.title('Tempering Parameter Evolution')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Subplot 6: Memory coefficient importance
+    plt.subplot(2, 3, 6)
+    lags_ma = range(len(ma_coeffs))
+    lags_ar = range(len(ar_coeffs))
+    
+    plt.bar(lags_ma, np.abs(ma_coeffs), alpha=0.7, label='MA Coefficients', color='blue')
+    plt.bar(lags_ar, np.abs(ar_coeffs), alpha=0.7, label='AR Coefficients', color='red')
+    plt.xlabel('Lag')
+    plt.ylabel('Absolute Coefficient Value')
+    plt.title('Memory Coefficient Importance')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figs/fig8_enhanced_analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Figure 9: Performance summary dashboard
+    plt.figure(figsize=(12, 8))
+    
+    # Create a summary table
+    metric_names = ['MSE', 'MAE', 'SMAPE', 'R²', 'Directional Acc']
+    metric_values = [metrics['mse'], metrics['mae'], metrics['smape'], metrics['r2'], metrics['da']]
+    
+    plt.subplot(2, 2, 1)
+    bars = plt.bar(metric_names, metric_values, color=['skyblue', 'lightcoral', 'lightgreen', 'gold', 'violet'])
+    plt.ylabel('Metric Value')
+    plt.title('Performance Metrics Summary')
+    plt.xticks(rotation=45)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, metric_values):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                f'{value:.4f}', ha='center', va='bottom', fontsize=10)
+    
+    # Parameter final values
+    plt.subplot(2, 2, 2)
+    with torch.no_grad():
+        param_names = ['μ', 'ν', 'λ', 'λ_ε', 'λ_Y']
+        param_values = [model.mu_eff().item(), model.nu_eff().item(), 
+                       model.lam_eff().item(), model.lame_eff().item(), 
+                       model.lamY_eff().item()]
+    
+    bars = plt.bar(param_names, param_values, color=['blue', 'red', 'green', 'cyan', 'magenta'])
+    plt.ylabel('Parameter Value')
+    plt.title('Final Parameter Values')
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, param_values):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                f'{value:.3f}', ha='center', va='bottom', fontsize=10)
+    
+    # Memory horizon comparison
+    plt.subplot(2, 2, 3)
+    validator = TheoreticalValidator()
+    ma_horizon = validator.memory_horizon(model.lame_eff().item())
+    ar_horizon = validator.memory_horizon(model.lamY_eff().item())
+    
+    horizons = [ma_horizon, ar_horizon]
+    labels = ['MA Memory', 'AR Memory']
+    colors = ['blue', 'red']
+    
+    bars = plt.bar(labels, horizons, color=colors, alpha=0.7)
+    plt.ylabel('Effective Memory Horizon (lags)')
+    plt.title('Memory Structure')
+    
+    for bar, value in zip(bars, horizons):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, 
+                f'{value:.1f}', ha='center', va='bottom', fontsize=10)
+    
+    # Performance comparison
+    plt.subplot(2, 2, 4)
+    naive_mse = np.mean((y_true[1:] - y_true[:-1])**2)
+    improvement = (naive_mse - metrics['mse']) / naive_mse * 100
+    
+    comparisons = ['TF-AMAR MSE', 'Naive MSE', 'Improvement']
+    values = [metrics['mse'], naive_mse, improvement]
+    colors = ['green', 'red', 'blue']
+    
+    bars = plt.bar(comparisons[:2], values[:2], color=colors[:2], alpha=0.7)
+    plt.ylabel('MSE Value')
+    plt.title('Model vs Naive Forecast')
+    
+    for bar, value in zip(bars, values[:2]):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.00001, 
+                f'{value:.6f}', ha='center', va='bottom', fontsize=9)
+    
+    # Add improvement as text
+    plt.text(1, max(values[:2])/2, f'Improvement: {improvement:.1f}%', 
+             ha='center', va='center', fontsize=12, color='blue', weight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('figs/fig9_performance_dashboard.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+# =============================================================
+# Training and Evaluation Function
+# =============================================================
+def train_and_evaluate_tfamar(epochs=300, patience=30, lr=0.01):
+    """Complete training and evaluation pipeline"""
+    ensure_dir()
+    
+    # Generate data
+    Y, E = generate_synthetic_data(1000)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    Y = Y.to(device)
+    E = E.to(device)
+    
+    # Split data (80% train, 20% validation)
+    split_idx = int(0.8 * len(Y))
+    Y_train, Y_val = Y[:split_idx], Y[split_idx:]
+    E_train, E_val = E[:split_idx], E[split_idx:]
+    
+    # Initialize model
+    model = EnhancedTFAMAR(p=5, q=3).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Training history
+    losses = []
+    param_history = {
+        'mu': [], 'nu': [], 'lambda_param': [], 
+        'lambda_eps': [], 'lambda_Y': []
+    }
+    
+    # Training loop
+    print("Training TF-AMAR model...")
+    best_loss = float('inf')
+    wait = 0
+    start_idx = max(100, model.p, model.q)
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        
+        # Training predictions
+        y_pred_train = model.batch_predict(Y_train, E_train, start_idx)
+        y_true_train = Y_train[start_idx:]
+        
+        loss = nn.MSELoss()(y_pred_train, y_true_train)
+        loss.backward()
+        optimizer.step()
+        
+        losses.append(loss.item())
+        
+        # Record parameters
+        with torch.no_grad():
+            param_history['mu'].append(model.mu_eff().item())
+            param_history['nu'].append(model.nu_eff().item())
+            param_history['lambda_param'].append(model.lam_eff().item())
+            param_history['lambda_eps'].append(model.lame_eff().item())
+            param_history['lambda_Y'].append(model.lamY_eff().item())
+        
+        # Early stopping
+        if loss.item() < best_loss - 1e-6:
+            best_loss = loss.item()
+            wait = 0
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+        
+        if epoch % 50 == 0:
+            print(f"Epoch {epoch}: Loss = {loss.item():.6f}")
+    
+    # Load best model
+    model.load_state_dict(best_model_state)
+    
+    # Validation
+    with torch.no_grad():
+        y_pred_val = model.batch_predict(Y_val, E_val, start_idx)
+        y_true_val = Y_val[start_idx:]
+        
+        # Calculate metrics
+        mse = float(np.mean((y_true_val.cpu().numpy() - y_pred_val.cpu().numpy()) ** 2))
+        mae = float(np.mean(np.abs(y_true_val.cpu().numpy() - y_pred_val.cpu().numpy())))
+        
+        # R-squared
+        ss_res = np.sum((y_true_val.cpu().numpy() - y_pred_val.cpu().numpy()) ** 2)
+        ss_tot = np.sum((y_true_val.cpu().numpy() - np.mean(y_true_val.cpu().numpy())) ** 2)
+        r2 = float(1 - (ss_res / ss_tot)) if ss_tot != 0 else 0.0
+        
+        # Directional accuracy
+        da = float(np.mean(np.sign(y_pred_val.cpu().numpy()) == np.sign(y_true_val.cpu().numpy())) * 100.0)
+        
+        # SMAPE
+        den = np.abs(y_true_val.cpu().numpy()) + np.abs(y_pred_val.cpu().numpy())
+        smape = float(100 * np.mean(2 * np.abs(y_pred_val.cpu().numpy() - y_true_val.cpu().numpy()) / (den + 1e-6)))
+    
+    return model, losses, param_history, (y_true_val.cpu().numpy(), y_pred_val.cpu().numpy()), {
+        'mse': mse, 'mae': mae, 'smape': smape, 'r2': r2, 'da': da
+    }
+
+# =============================================================
+# Main Execution
+# =============================================================
+if __name__ == "__main__":
+    print("Starting TF-AMAR Comprehensive Analysis...")
+    
+    # Step 1: Generate theoretical property figures
+    print("1. Generating theoretical property figures...")
+    plot_theoretical_properties()
+    
+    # Step 2: Train and evaluate model
+    print("2. Training TF-AMAR model...")
+    model, losses, param_history, val_predictions, metrics = train_and_evaluate_tfamar()
+    
+    # Step 3: Generate training and model analysis figures
+    print("3. Generating training and analysis figures...")
+    plot_training_results(model, losses, param_history, val_predictions)
+    
+    # Step 4: Generate enhanced analysis figures
+    print("4. Generating enhanced analysis figures...")
+    create_enhanced_figures(model, metrics, param_history, val_predictions)
+    
+    # Step 5: Print results summary
+    print("\n5. Printing results summary...")
+    print("\n" + "="*80)
+    print("TF-AMAR COMPREHENSIVE RESULTS SUMMARY")
+    print("="*80)
+    
+    print("\n📊 PERFORMANCE METRICS:")
+    print(f"   Mean Squared Error (MSE):      {metrics['mse']:.6f}")
+    print(f"   Mean Absolute Error (MAE):     {metrics['mae']:.6f}")
+    print(f"   Symmetric MAPE:                {metrics['smape']:.2f}%")
+    print(f"   R-squared (R²):                {metrics['r2']:.4f}")
+    print(f"   Directional Accuracy:          {metrics['da']:.2f}%")
+    
+    print("\n🔧 MODEL PARAMETERS (Final):")
+    with torch.no_grad():
+        print(f"   μ (MA fractional order):      {model.mu_eff().item():.4f}")
+        print(f"   ν (AR fractional order):      {model.nu_eff().item():.4f}")
+        print(f"   λ (scaling parameter):        {model.lam_eff().item():.4f}")
+        print(f"   λ_ε (MA tempering):           {model.lame_eff().item():.4f}")
+        print(f"   λ_Y (AR tempering):           {model.lamY_eff().item():.4f}")
+    
+    print(f"\n✅ Analysis complete! Check './figs/' directory for all generated figures.")
+    print("   Figures generated:")
+    print("   - fig1_weight_asymptotics.png")
+    print("   - fig2_tempered_decay.png") 
+    print("   - fig3_alignment_coefficient.png")
+    print("   - fig4_training_loss.png")
+    print("   - fig5_parameter_trajectories.png")
+    print("   - fig6_memory_coefficients.png")
+    print("   - fig7_prediction_analysis.png")
+    print("   - fig8_enhanced_analysis.png")
+    print("   - fig9_performance_dashboard.png")
+
+
+------------------------------------------------------------------
+
+Results : 
+
+Starting TF-AMAR Comprehensive Analysis...
+1. Generating theoretical property figures...
+2. Training TF-AMAR model...
+Training TF-AMAR model...
+Epoch 0: Loss = 0.000336
+Epoch 50: Loss = 0.000241
+Epoch 100: Loss = 0.000146
+Epoch 150: Loss = 0.000132
+Epoch 200: Loss = 0.000121
+Epoch 250: Loss = 0.000113
+3. Generating training and analysis figures...
+4. Generating enhanced analysis figures...
+
+5. Printing results summary...
+
+================================================================================
+TF-AMAR COMPREHENSIVE RESULTS SUMMARY
+================================================================================
+
+📊 PERFORMANCE METRICS:
+   Mean Squared Error (MSE):      0.000096
+   Mean Absolute Error (MAE):     0.007835
+   Symmetric MAPE:                134.80%
+   R-squared (R²):                0.2358
+   Directional Accuracy:          65.00%
+
+🔧 MODEL PARAMETERS (Final):
+   μ (MA fractional order):      0.7155
+   ν (AR fractional order):      0.3338
+   λ (scaling parameter):        3.0887
+   λ_ε (MA tempering):           0.4869
+   λ_Y (AR tempering):           0.5568
+
+✅ Analysis complete! Check './figs/' directory for all generated figures.
+   Figures generated:
+   - fig1_weight_asymptotics.png
+   - fig2_tempered_decay.png
+   - fig3_alignment_coefficient.png
+   - fig4_training_loss.png
+   - fig5_parameter_trajectories.png
+   - fig6_memory_coefficients.png
+   - fig7_prediction_analysis.png
+   - fig8_enhanced_analysis.png
+   - fig9_performance_dashboard.png
